@@ -1,9 +1,0 @@
-LICENSE
-README.md
-pyproject.toml
-src/vsdebug/__init__.py
-src/vsdebug.egg-info/PKG-INFO
-src/vsdebug.egg-info/SOURCES.txt
-src/vsdebug.egg-info/dependency_links.txt
-src/vsdebug.egg-info/entry_points.txt
-src/vsdebug.egg-info/top_level.txt
