@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""vsdebug: lightweight helper for VS Code C++ debug configurations.
+
+This script automates common workflows around VS Code's
+`.vscode/launch.json` for C++ projects, including:
+
+* Adding or updating a launch configuration and immediately starting
+    the debugger (``PUT``).
+* Running an existing configuration outside the debugger (``RUN``).
+* Spawning MPI jobs under ``mpirun`` and generating per-rank attach
+    configurations plus an ``MPI`` compound (``MPI`` / ``MPI1``).
+* Backing up, listing, clearing and reverting ``launch.json``.
+
+It is intentionally conservative with behavior: before mutating the
+launch file it will create timestamped backups under
+``.vscode/launch-backups``. For customization, you can place a JSON
+file at ``~/.vscode/.vsdebug-config``; see ``load_config_file_if_exists``
+for the supported keys.
+
+Typical usage from a build directory might look like::
+
+        # Add configuration "test_mldc" for ./mldc and start debugger
+        vsdebug PUT test_mldc ./mldc d:compress --in ../../data/sample.q3 --out out.q3
+
+        # Re-run that configuration without debugging
+        vsdebug RUN test_mldc
+
+        # Launch 4 MPI ranks under mpirun and attach with cppdbg
+        vsdebug MPI 4 ./mldc d:compress --in ...
+
+The script expects to be invoked from somewhere under a workspace that
+contains a ``.vscode`` directory; it walks upward from the current
+working directory until it finds one.
+"""
+
+import json
+import sys
+import os
+from pathlib import Path
+import subprocess
+import time
+import psutil
+from datetime import datetime
+import shutil
+
+def get_vscode_directory() -> str:
+    """Return the absolute path to the workspace ``.vscode`` directory.
+
+    Walks up from the current working directory until it finds a
+    ``.vscode`` folder. Exits with a message if none is found.
+    """
+
+    current_directory = Path(os.getcwd())
+    while not os.path.exists(os.path.join(current_directory, ".vscode")):
+        current_directory = current_directory.parent
+        if current_directory == Path(os.path.sep):
+            print("Could not find a vscode directory")
+            sys.exit(1)
+    return os.path.join(current_directory, ".vscode")
+
+def get_backup_dir() -> str:
+    """Directory where timestamped ``launch.json`` backups are stored."""
+
+    vscode_dir = get_vscode_directory()
+    backup_dir = os.path.join(vscode_dir, "launch-backups")
+    return backup_dir
+
+
+def load_config_file_if_exists():
+    """Load user configuration from ``~/.vscode/.vsdebug-config`` if present.
+
+    Returns the parsed JSON object or ``None`` if the file does not
+    exist or cannot be parsed. This file can override defaults such as
+    the launch/attach templates, ``mpirun`` path.
+    """
+
+    home_config = Path.home() / "vscode" / ".vsdebug-config"
+    if home_config.exists():
+        try:
+            with open(home_config, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            # Ignore malformed user config; fall back to built-in defaults.
+            pass
+
+    return None
+
+
+def get_launch_configuration(name, program, args, cwd, env):
+    vsdebug_config = load_config_file_if_exists()
+    if vsdebug_config is not None and "launchConfig" in vsdebug_config:
+        return vsdebug_config["launchConfig"]
+
+    return {
+        "name": name,
+        "type": "cppdbg",
+        "request": "launch",
+        "program": program,
+        "args": args,
+        "stopAtEntry": False,
+        "cwd": cwd,
+        "environment": [{"name": a, "value": b} for a, b in env],
+        "externalConsole": False,
+        "MIMode": "gdb",
+        "setupCommands": [
+            {
+                "description": "Enable pretty-printing for gdb",
+                "text": "-enable-pretty-printing",
+                "ignoreFailures": True,
+            },
+            {
+                "description": "Set Disassembly Flavor to Intel",
+                "text": "-gdb-set disassembly-flavor intel",
+                "ignoreFailures": True,
+            },
+        ],
+    }
+
+def get_attach_configuration(name, program, process):
+    vsdebug_config = load_config_file_if_exists()
+    if vsdebug_config is not None and "attachConfig" in vsdebug_config:
+        return vsdebug_config["attachConfig"]
+
+    return {
+        "name": name,
+        "type": "cppdbg",
+        "request": "attach",
+        "program": program,
+        "processId": process,
+        "MIMode": "gdb",
+        "setupCommands": [
+            {
+                "description": "Enable pretty-printing for gdb",
+                "text": "-enable-pretty-printing",
+                "ignoreFailures": True,
+            },
+            {
+                "description": "Set Disassembly Flavor to Intel",
+                "text": "-gdb-set disassembly-flavor intel",
+                "ignoreFailures": True,
+            },
+        ],
+    }
+
+def run_mpirun_and_get_pids(procs, program, program_opts, program_dir):
+    """Run ``mpirun`` and return its process handle and list of MPI PIDs.
+
+    ``procs`` is the number of ranks (string or int), ``program`` is the
+    executable, and ``program_opts`` are passed through as arguments.
+    ``program_dir`` sets the working directory for the spawned job.
+    """
+    # Start mpirun as a subprocess
+    mpirun = "mpirun"
+    vsdebug_config = load_config_file_if_exists()
+    if vsdebug_config is not None and "mpirunPath" in vsdebug_config:
+        mpirun = vsdebug_config["mpirunPath"]
+
+    proc = subprocess.Popen(
+        [mpirun, "-n", procs, program] + program_opts,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=os.environ,
+        bufsize=1,
+        cwd=program_dir,
+        universal_newlines=True,  # text mode
+    )
+    # Give mpirun a moment to spawn children
+    time.sleep(1)
+    # Find all child processes of mpirun
+    try:
+        parent = psutil.Process(
+            proc.pid
+        )  # This is the shell running the mpirun command (generated by subprocess)
+        allc = [
+            a.pid for a in parent.children(recursive=True)
+        ]  # This is all the processes spawned
+        some = [a.pid for a in parent.children()]  # This is the mpirun process.
+        mpi_pids = [
+            a for a in allc if a not in some
+        ]  # These are the MPI processes spawned by mpirun
+        
+    except Exception:
+        mpi_pids = []
+    return proc, mpi_pids
+
+def append_or_update_configurations(launch_json, name, config):
+    configs = launch_json["configurations"]
+    for i in range(0, len(configs)):
+        if (configs[i]["name"] == name):
+            launch_json["configurations"][i] = config
+            return        
+    launch_json["configurations"].append(config)
+
+def append_or_update_compounds(launch_json, name, config_list):
+    if ("compounds" not in launch_json):
+        launch_json["compounds"] = []
+
+    compounds = launch_json["compounds"]
+    for i in range(0, len(compounds)):
+        if (compounds[i]["name"] == name):
+            launch_json["compounds"][i]["configurations"] = config_list
+            return    
+           
+    launch_json["compounds"].append({"name": "MPI", "configurations": config_list})
+
+def mpi_launch(launch_json, processes, program, program_opts, program_dir):
+    """Launch MPI job and create per-rank attach configs plus an MPI compound."""
+    print(f"Running Command: mpirun -n {processes} {program} {' '.join(program_opts)}")
+    proc_ob, mpi_pids = run_mpirun_and_get_pids(processes, program, program_opts, program_dir)
+    
+    if len(mpi_pids) == 0:
+        print("No MPI processes found. Command might have failed, or finished too quickly.")
+        return
+    
+    ff = []
+    count = 0
+    for process in mpi_pids:
+
+        name = "mpi-proc-" + str(count)
+        append_or_update_configurations(launch_json, name, get_attach_configuration(name, program, process))
+        ff.append(name)
+
+    append_or_update_compounds(launch_json, "MPI", ff)
+    update_launch_file(launch_json)
+    time.sleep(1)
+    launch_debugger("MPI")
+
+    for line in proc_ob.stdout:
+        print(line.strip())
+
+    proc_ob.wait()
+
+def update_launch_file(launch_json, backup=True):
+    launchfile = get_launch_file()
+    if backup:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_dir = get_backup_dir()
+        backup_path = f"{backup_dir}/launch.{ts}.vsdebug-backup"
+        try:
+            if not os.path.exists(f"{backup_dir}"):
+                os.makedirs(f"{backup_dir}")
+                
+            shutil.copy2(launchfile, backup_path)
+        except Exception as e:
+            print(f"Unable to create backup: {e}")
+            return
+    
+    with open(launchfile, "w") as f:
+        json.dump(launch_json, f, indent=4)
+
+def launch_debugger(name):
+    """Trigger VS Code debugger for ``name`` via a debug-trigger file.
+
+    The path to the trigger file is ``.vscode/debug-trigger.txt`` in the workspace.
+    """
+    vscode_dir = get_vscode_directory()
+    debug_trigger_file = os.path.join(vscode_dir, "debug-trigger.txt")
+
+    print("Starting Debugger... (you must install the extension in the folder for this to work)")
+    with open(debug_trigger_file, "w") as f:
+        f.write(name)
+    
+def get_launch_file():
+    vscode_dir = get_vscode_directory()
+    launchfile = os.path.join(vscode_dir, "launch.json")
+    return launchfile
+
+def load_launch_file():
+    launchfile = get_launch_file()
+    if os.path.exists(launchfile):
+        with open(launchfile, "r") as f:
+            return json.load(f)
+    else:
+        return {"version": "0.2.0", "configurations": []}
+    
+def find_in_configs(launch_json, name):
+    configs = launch_json["configurations"]
+    for config in configs:
+        if (config["name"] == name):
+            return config
+    return None
+
+def list_backups():
+    f = []
+    files = os.listdir(get_backup_dir())
+    for file in files:
+        if file.endswith(".vsdebug-backup"):
+            f.append(file)
+    return f
+
+
+def print_config_sample() -> None:
+    """Print a sample ``~/.vscode/.vsdebug-config`` JSON to stdout.
+
+    This is a non-destructive helper: it does not write any files, it
+    only prints a commented template you can redirect into place, e.g.::
+
+        mkdir -p ~/.vscode
+        vsdebug CONFIG_SAMPLE > ~/.vscode/.vsdebug-config
+    """
+    print("The following is a sample ~/.vscode/.vsdebug-config JSON file.")
+    print("Create a file with this content to customize vsdebug behavior.")
+
+    sample = {
+        "mpirunPath": "/usr/bin/mpirun",
+        # Default launch configuration template; ``PUT`` will override
+        # name/program/args/cwd/environment as appropriate.
+        "launchConfig": {
+            "name": "${name}",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${program}",
+            "args": ["${args}"],
+            "stopAtEntry": False,
+            "cwd": "${cwd}",
+            "environment": [],
+            "externalConsole": False,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": True,
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": True,
+                },
+            ],
+        },
+        # Default attach configuration template used for MPI ranks.
+        "attachConfig": {
+            "name": "${name}",
+            "type": "cppdbg",
+            "request": "attach",
+            "program": "${program}",
+            "processId": "${pid}",
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": True,
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": True,
+                },
+            ],
+        },
+    }
+
+    # Pretty-print without Python comments (JSON doesn’t support them).
+    sys.stdout.write(json.dumps(sample, indent=4))
+
+def test():
+    """Run basic tests of vsdebug functionality."""
+    print("Running basic tests...")
+    main(["vsdebug", "CONFIG_SAMPLE"])
+    main(["vsdebug", "HELP"])
+    main(["vsdebug","PUT", "test", "/bin/echo", "hello"])
+    main(["vsdebug","GET", "test"])
+    main(["vsdebug","RUN", "test"])
+    main(["vsdebug","DEBUG", "test"])
+    main(["vsdebug","DELETE", "test"])
+    main(["vsdebug","CLEAR"])
+    main(["vsdebug","BACKUPS"])
+    main(["vsdebug","REVERT"])
+    main(["vsdebug","CLEAR_BACKUPS"])
+    
+    # Add more comprehensive tests as needed
+    print("All tests passed.")
+
+
+def main(args=sys.argv):
+    """Entry point for the ``vsdebug`` CLI.
+
+        ``args`` is typically ``sys.argv`` and supports the following
+        subcommands (case-insensitive):
+
+        * ``GET <name>`` – print cwd and command for a configuration.
+        * ``PUT <name> <program> <args...>`` – upsert a launch config and
+            trigger the debugger.
+        * ``RUN <name>`` – run a configuration without debugging.
+        * ``MPI <num_procs> <program> <args...>`` – run under mpirun and
+            generate attach configs.
+        * ``MPI1 <num_procs> <name>`` – same as ``MPI`` but sourced from an
+            existing configuration.
+        * ``DELETE <name>`` – remove a configuration from ``launch.json``.
+        * ``CLEAR`` – remove all configurations.
+                * ``CLEAR_BACKUPS`` – delete all ``.vsdebug-backup`` files.
+        * ``REVERT`` – interactively pick a backup to restore.
+        * ``BACKUPS`` – list available backups.
+        * ``DEBUG <name>`` – write the given name to the debug trigger
+          file, causing the extension to start that configuration.
+                * ``CONFIG_SAMPLE`` – print a sample ``.vsdebug-config`` JSON
+                    you can redirect into ``~/.vscode/.vsdebug-config``.
+        """
+
+    # Load the launch file if it exists otherwise create a new one
+    launch_json = load_launch_file()
+
+    # Perform the action requested
+    if len(args) < 2:
+        action = "HELP"
+    else:
+        action = args[1].upper()
+
+    if action == "GET":
+        c = find_in_configs(launch_json, args[2])
+        if c is None:
+            print(args[2], " Not found in current config list")
+        else:
+            print(f"DIR: {c['cwd']}\n{c['program']} {' '.join(c['args'])}")
+
+
+    elif action == "PUT" or action == "PUTN":
+        name = args[2]
+        if (name[0] == '.' or name[0] == '/'):
+            print("Invalid name for configuration ", name)
+            print("Did you forget to provide a name?")
+            return
+        
+        root_directory = os.getcwd()
+        program = os.path.abspath(os.path.join(root_directory, args[3]))
+        if (not os.path.exists(program)):
+            print("Program does not exist: ", program)
+            return
+        
+        cwd = root_directory
+        args = args[4:]
+
+        config = find_in_configs(launch_json, name)
+        new_config = get_launch_configuration(name, program, args, cwd, {})
+        if config is not None:
+            config.update(new_config)
+        else:
+            launch_json["configurations"].append(new_config)
+
+        update_launch_file(launch_json)
+        if action == "PUT":
+            launch_debugger(name)
+
+    elif action == "RUN":
+
+        name = args[2]
+        c = find_in_configs(launch_json, name)
+        if c is None:
+            print(args[2], " Not found in current config list")
+        else:
+            proc_ob = subprocess.Popen(
+                [c["program"]] + c["args"],
+                cwd=c["cwd"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=os.environ,
+                bufsize=1,
+                universal_newlines=True,  # text mode
+            )
+
+            for line in proc_ob.stdout:
+                print(line.strip())
+
+            proc_ob.wait()
+
+
+    elif action == "MPI":
+
+        processes = args[2]
+        root_directory = os.getcwd()
+        program = os.path.abspath(os.path.join(root_directory, args[3]))
+        program_opts = args[4:]
+        program_dir = root_directory
+        mpi_launch(launch_json, processes, program, program_opts, program_dir)
+
+    elif action == "MPI1":
+
+        processes = args[2]
+        name = args[3]
+        doc = find_in_configs(launch_json, name)
+        if doc is None:
+            print(args[2], " Not found in current config list")
+            return
+        
+        program = doc["program"]
+        program_opts = doc["args"]
+        program_dir = doc["cwd"]
+        mpi_launch(launch_json, processes, program, program_opts, program_dir)
+
+    elif action == "DELETE":
+        configs = launch_json["configurations"]
+        name = args[2]
+        for i in range(0, len(configs)):
+            if (configs[i]["name"] == name):
+                configs.pop(i)
+                update_launch_file(launch_json)
+                return
+        else:
+            print("name not found in list")
+
+    elif action == "CLEAR":
+        launch_json["configurations"] = []
+        update_launch_file(launch_json)
+        
+    elif action == "CLEAR_BACKUPS":
+        backup_dir = get_backup_dir()
+        files = os.listdir(backup_dir)
+        for file in files:
+            if file.endswith(".vsdebug-backup"):
+                os.remove(os.path.join(backup_dir, file))
+        print("All backups removed.")
+    
+    elif action == "REVERT":
+        f = list_backups()
+        print("Available backups:")
+        for n, file in enumerate(f):
+            print(f"{n}: {file}")
+        print("What backup file do you want to revert to?   (enter number)")
+        selection = input()
+        try:
+            selection = int(selection)
+            backup = f[selection]
+        except Exception:
+            print("Invalid selection")
+            return
+
+        backup_dir = get_backup_dir()
+        backupPath = os.path.abspath(os.path.join(backup_dir, backup))
+        with open(backupPath, "r") as f:
+            launch_json = json.load(f)
+            update_launch_file(launch_json)
+
+    elif action == "BACKUPS":
+        f = list_backups()
+        for file in f:
+            print(file)
+
+    elif action == "DEBUG":
+        launch_debugger(args[2])
+
+    elif action == "CONFIG_SAMPLE":
+        print_config_sample()
+
+    elif action == "__TEST__":
+        test()
+
+    else:
+        print(f'''
+vsdebug: lightweight helper for VS Code C++ debug configurations.
+              
+What does is do?
+    
+    This script automates common workflows around VS Code's
+    `.vscode/launch.json` for C++ projects. It can add or update
+    launch configurations, run them under the debugger or directly,
+    spawn MPI jobs with per-rank attach configurations, and manage
+    backups of the launch file. This allows you to control the debugger
+    from the integrated terminal without needing to manually edit JSON.
+               
+Launching Debugging: 
+              
+    The script can trigger the VS Code debugger to start a given
+    configuration. To enable this you must install the "Debug Trigger" extension
+    in your workspace (search for "debug trigger" in the extensions panel). The Debug
+    trigger extension watches for changes to a file called `.vscode/debug-trigger.txt`.
+    When the file changes, it reads the contents and starts the debugger for the named configuration
+    in that file. This saves you from needing to click the green "Start Debugging" button (yes, I really
+    am that lazy).
+                          
+Usage:
+        vsdebug HELP --> will print this message
+        vsdebug GET <name> --> will print out the command 
+        vsdebug PUT <name> <program> <args> --> will add the command to the launch file and start the debugger
+        vsdebug PUTN <name> <program> <args> --> will add the command to the launch file but NOT start  the debugger
+        vsdebug MPI <num_procs> <program> <args> --> will run the command in parallel using mpirun
+        vsdebug MPI1 <num_procs> <name> --> will run the named configuration in parallel using mpirun
+        vsdebug DELETE <name> --> will delete the command from the launch file
+        vsdebug CLEAR --> will delete all commands from the launch file
+        vsdebug REVERT <backup-file> --> will revert the launch file to the specified backup
+        vsdebug RUN <name> --> will run the command without debugging
+        vsdebug BACKUPS --> will list the available backup files
+        vsdebug DEBUG <name> --> will start the debugger for the specified configuration
+        vsdebug CONFIG_SAMPLE --> will print a sample ~/.vscode/.vsdebug-config JSON    
+        ''')
+
+
+
+if __name__ == "__main__":
+    main()
