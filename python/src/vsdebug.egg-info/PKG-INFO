@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: vsdebug
-Version: 0.1.0
+Version: 0.1.3
 Summary: Lightweight helper for managing VS Code C++ launch.json debug configurations.
 Author: Ben O'Neill
 License: MIT
@@ -42,3 +42,8 @@ vsdebug PUT my_config ./a.out arg1 arg2
 vsdebug RUN my_config
 vsdebug MPI 4 ./a.out arg1 arg2
 ```
+## Launch the Debugger
+
+To enable support for starting the debugger from the script, you will need to install 
+the vscode extension "CMD Debug Trigger". To install the extension, search for it in 
+the vscode marketplace and install. 

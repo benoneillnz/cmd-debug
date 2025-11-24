@@ -596,8 +596,8 @@ What does is do?
 Launching Debugging: 
               
     The script can trigger the VS Code debugger to start a given
-    configuration. To enable this you must install the "Debug Trigger" extension
-    in your workspace (search for "debug trigger" in the extensions panel). The Debug
+    configuration. To enable this you must install the "CMD Debug Trigger" extension
+    in your workspace (search for "CMD Debug Trigger" in the VSCode MarketPlace). The Debug
     trigger extension watches for changes to a file called `.vscode/debug-trigger.txt`.
     When the file changes, it reads the contents and starts the debugger for the named configuration
     in that file. This saves you from needing to click the green "Start Debugging" button (yes, I really

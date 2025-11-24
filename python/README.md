@@ -23,3 +23,8 @@ vsdebug PUT my_config ./a.out arg1 arg2
 vsdebug RUN my_config
 vsdebug MPI 4 ./a.out arg1 arg2
 ```
+## Launch the Debugger
+
+To enable support for starting the debugger from the script, you will need to install 
+the vscode extension "CMD Debug Trigger". To install the extension, search for it in 
+the vscode marketplace and install. 
