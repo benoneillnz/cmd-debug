@@ -43,6 +43,17 @@ import psutil
 from datetime import datetime
 import shutil
 
+
+def cli() -> None:
+    """Console_script entry point.
+
+    Delegates to :func:`main` which implements the CLI, keeping
+    backward compatibility with the existing ``main(args=sys.argv)``
+    signature used throughout the module.
+    """
+
+    main(sys.argv)
+
 def get_vscode_directory() -> str:
     """Return the absolute path to the workspace ``.vscode`` directory.
 
@@ -55,7 +66,22 @@ def get_vscode_directory() -> str:
         current_directory = current_directory.parent
         if current_directory == Path(os.path.sep):
             print("Could not find a vscode directory")
-            sys.exit(1)
+            print("This code must be run from inside a VS Code workspace.")
+            print("Should I create one for you? (y/n)")
+            response = input().strip().lower()
+            if response == 'y':
+               response = input("Enter the path where you want to create the workspace: ").strip()
+               try:
+                     os.makedirs(os.path.join(response, ".vscode"), exist_ok=True)
+                     print(f"Created .vscode directory at {response}")
+                     return os.path.join(response, ".vscode")
+               except Exception as e:
+                     print(f"Failed to create .vscode directory: {e}")
+                     sys.exit(1)
+            else:         
+                print("OK. Exiting.")
+                sys.exit(1)
+
     return os.path.join(current_directory, ".vscode")
 
 def get_backup_dir() -> str:
@@ -263,6 +289,11 @@ def launch_debugger(name):
 def get_launch_file():
     vscode_dir = get_vscode_directory()
     launchfile = os.path.join(vscode_dir, "launch.json")
+    if not os.path.exists(launchfile):
+        # Create an empty launch file
+        with open(launchfile, "w") as f:
+            json.dump({"version": "0.2.0", "configurations": []}, f, indent=4)
+            
     return launchfile
 
 def load_launch_file():
@@ -514,6 +545,9 @@ def main(args=sys.argv):
     
     elif action == "REVERT":
         f = list_backups()
+        if len(f) == 0:
+            print("No backups available to revert to.")
+            return
         print("Available backups:")
         for n, file in enumerate(f):
             print(f"{n}: {file}")
@@ -585,7 +619,5 @@ Usage:
         vsdebug CONFIG_SAMPLE --> will print a sample ~/.vscode/.vsdebug-config JSON    
         ''')
 
-
-
 if __name__ == "__main__":
-    main()
+    main(sys.argv)

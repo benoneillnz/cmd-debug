@@ -3,7 +3,7 @@
   "displayName": "CMD Debug Trigger",
   "description": "Start the VS Code debugger from the integrated terminal by writing to a file.",
   "version": "0.1.0",
-  "publisher": "your-publisher-id",
+  "publisher": "BenONeill",
   "repository": {
     "type": "git",
     "url": "https://github.com/benoneillnz/cmd-debug.git"

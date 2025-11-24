@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vsdebug"
+version = "0.1.0"
+description = "Lightweight helper for managing VS Code C++ launch.json debug configurations."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+  { name = "Ben O'Neill" }
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Topic :: Software Development :: Debuggers"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/benoneillnz/cmd-debug"
+"Source" = "https://github.com/benoneillnz/cmd-debug/tree/main/python"
+
+[project.scripts]
+vsdebug = "vsdebug:cli"
